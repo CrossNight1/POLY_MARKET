@@ -114,4 +114,5 @@ def setup_logger_global(name, log_file, level=logging.DEBUG):
     """
     return setup_logger(name, LOGGER_PATH +log_file, level)
 
-logger_arb = setup_logger("arbitrage", './logger/arbitrage.log')
+logger_arb = setup_logger("arbitrage", './logger/poly_arbitrage.log')
+logger_polymarket = setup_logger("polymarket", './logger/polymarket.log')

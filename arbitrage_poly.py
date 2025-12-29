@@ -2,90 +2,171 @@ import redis
 import json
 import time
 import threading
-from logger import logger_arb
+from datetime import datetime
+from logger import setup_logger
 
 r = redis.Redis(host='localhost', port=6379, db=0)
 
-def monitor_ticker(ticker: str):
-    key_up = f"{ticker}_up_15m_polymarket_ticker"
-    key_down = f"{ticker}_down_15m_polymarket_ticker"
+class PolyArbitrage:
+    def __init__(self, client, symbol, params, redis):
+        self.client = client
+        self.symbol = symbol
+        self.edge = params["edge"]
+        self.sleep = params.get("sleep_time", 0.01)
+        self.logger = setup_logger(f"arbitrage_{symbol}", f'./logger/{symbol}_poly_arbitrage.log')
+        self.redis = redis
 
-    EDGE = 0.002        # fees + slippage buffer
-    SLEEP = 0.1         # loop delay
-    STALE_UP = 1000     # ms
-    STALE_DOWN = 1000   # ms
+        self.key_up = f"{symbol}_up_15m_polymarket_ticker"
+        self.key_down = f"{symbol}_down_15m_polymarket_ticker"
 
-    u_bb = u_bsz = u_ba = u_asz = None
-    d_bb = d_bsz = d_ba = d_asz = None
+        self.up_id = None
+        self.down_id = None
 
-    i = 0
-    while True:
+        self.last_trade_ts = 0
+
+    def _read(self, key):
+        raw = self.redis.get(key)
+        if not raw:
+            return None
+        t = json.loads(raw)
+        if time.time() * 1000 - t["ts"] > 500:
+            return None
+        return t
+
+    def _place_leg(self, market, side, size, price, result, key):
         try:
-            i += 1
-            miss_u = None
-            miss_d = None
-
-            now_ms = time.time() * 1000
-
-            up_raw = r.get(key_up)
-            down_raw = r.get(key_down)
-
-            if up_raw:
-                t = json.loads(up_raw)
-                u_ts = t.get("ts")
-                if u_ts is None or now_ms - u_ts > STALE_UP:
-                    time.sleep(SLEEP)
-                    continue
-
-                u_bb  = t.get("bestBid", u_bb)
-                u_bsz = t.get("bidSz", u_bsz)
-                u_ba  = t.get("bestAsk", u_ba)
-                u_asz = t.get("askSz", u_asz)
-
-            if down_raw:
-                t = json.loads(down_raw)
-                d_ts = t.get("ts")
-                if d_ts is None or now_ms - d_ts > STALE_DOWN:
-                    time.sleep(SLEEP)
-                    continue
-
-                d_bb  = t.get("bestBid", d_bb)
-                d_bsz = t.get("bidSz", d_bsz)
-                d_ba  = t.get("bestAsk", d_ba)
-                d_asz = t.get("askSz", d_asz)
-
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-            # DOWN ask vs UP bid
-            if u_bb is not None and d_ba is not None:
-                miss_u = 1 - (u_bb + d_ba)
-                if miss_u > EDGE:
-                    size = min(u_bsz or 0, d_asz or 0)
-                    if size > 0:
-                        logger_arb.info(f"[{ts}] {ticker} ARB UP | edge={miss_u:.4f} | BUY {size}")
-
-            # UP ask vs DOWN bid
-            if u_ba is not None and d_bb is not None:
-                miss_d = 1 - (u_ba + d_bb)
-                if miss_d > EDGE:
-                    size = min(d_bsz or 0, u_asz or 0)
-                    if size > 0:
-                        logger_arb.info(f"[{ts}] {ticker} ARB DOWN | edge={miss_d:.4f} | BUY {size}")
-            
-            if i >= 50: 
-                logger_arb.debug(f"[{ts}] {ticker} | miss_u={miss_u:.4f} - {u_ba:.4f} vs {d_bb:.4f} | miss_d={miss_d:.4f} - {u_bb:.4f} vs {d_ba:.4f}")
-                i = 0
-            time.sleep(SLEEP)
-
+            # resp = self.client.place_order(
+            #     market=market,
+            #     order_side=side,
+            #     quantity=size,
+            #     order_type="LIMIT",
+            #     price=price
+            # )
+            resp = {"code": 0}
+            result[key] = resp
         except Exception as e:
-            logger_arb.error(f"[{ticker}] error: {e}")
-            time.sleep(5)
+            result[key] = e
 
+    def _execute(self, mkt_1, mkt_2, side, size, buy_px, sell_px, edge):
+        ts = time.strftime("%H:%M:%S")
+        self.logger.info(
+            f"[{ts}] {self.symbol} ARB {side} edge={edge:.4f} size={size}"
+        )
+
+        result = {}
+
+        t_buy = threading.Thread(
+            target=self._place_leg,
+            args=(mkt_1, side.upper(), size, buy_px, result, side.lower()),
+            daemon=True
+        )
+
+        t_sell = threading.Thread(
+            target=self._place_leg,
+            args=(mkt_2, side.upper(), size, sell_px, result, side.lower()),
+            daemon=True
+        )
+
+        t_buy.start()
+        t_sell.start()
+
+        t_buy.join(timeout=2)
+        t_sell.join(timeout=2)
+
+        # -------- logging & sanity --------
+        buy_ok = isinstance(result.get("buy"), dict) and result["buy"].get("code") == 0
+        sell_ok = isinstance(result.get("sell"), dict) and result["sell"].get("code") == 0
+
+        if buy_ok and sell_ok:
+            self.logger.info(f"{self.symbol} BOTH LEGS OK")
+        elif buy_ok and not sell_ok:
+            self.logger.error(f"{self.symbol} BUY OK / SELL FAIL → HEDGE REQUIRED")
+        elif sell_ok and not buy_ok:
+            self.logger.error(f"{self.symbol} SELL OK / BUY FAIL → HEDGE REQUIRED")
+        else:
+            self.logger.error(f"{self.symbol} BOTH LEGS FAILED")
+
+    def check_run_time(self):
+        minute = datetime.now().minute
+
+        # 14–16, 29–31, 44–46, 59–01
+        if minute % 15 in (14, 15, 0):
+            return False
+
+        return True        
+
+    def monitor(self):
+        self.logger.info(f"Start Running POLY ARBITRAGE {self.symbol}")
+        
+        while True:
+            try:
+                if not self.check_run_time:
+                    time.sleep(10)
+                    continue
+                
+                up = self._read(self.key_up)
+                down = self._read(self.key_down)
+                
+                if not up or not down:
+                    time.sleep(self.sleep)
+                    continue
+
+                self.up_id = up["token_id"]
+                self.down_id = down["token_id"]
+
+                # ---------------- ARB BUY ----------------
+                miss_b = 1.0 - (up["bestAsk"] + down["bestAsk"])
+                if miss_b > self.edge:
+                    size = min(up["askSz"], down["askSz"])
+                    if size > 0:
+                        self._execute(
+                            "UP", "DOWN",
+                            "BUY",
+                            size,
+                            up["bestAsk"],
+                            down["bestAsk"],
+                            miss_b
+                        )
+                        continue  # prevent double fire same tick
+
+                # ---------------- ARB SELL ----------------
+                miss_s = (up["bestBid"] + down["bestBid"]) - 1
+                if miss_s > self.edge:
+                    size = min(down["bidSz"], up["bidSz"])
+                    if size > 0:
+                        self._execute(
+                            "UP", "DOWN",
+                            "SELL",
+                            size,
+                            up["bestBid"],
+                            down["bestBid"],
+                            miss_s
+                        )
+
+                time.sleep(self.sleep)
+
+            except Exception as e:
+                self.logger.error(f"{self.symbol} error: {e}")
+                time.sleep(1)
+
+
+
+
+TICKERS = ["ETH", "BTC", "SOL", "XRP"]
 threads = []
-TICKERS = ["ETH"]
 
-for t in TICKERS:
-    th = threading.Thread(target=monitor_ticker, args=(t,), daemon=True)
+for symbol in TICKERS:
+    arb = PolyArbitrage(
+        client="client",                      # real client, not string
+        symbol=symbol,
+        params={"edge": 0.002, "sleep_time": 0.05},
+        redis=r
+    )
+
+    th = threading.Thread(
+        target=arb.monitor,   
+        daemon=True
+    )
     th.start()
     threads.append(th)
 
